@@ -1,5 +1,6 @@
 """RepoLens web app: dashboard shell + ZIP ingestion (Phase 1), per-commit
-file metrics and the analysis pipeline (Phases 2-4).
+file metrics and the analysis pipeline (Phases 2-5), and remote URL cloning
+as a background job (Phase 6).
 
 Run with:  python3 -m uvicorn backend.main:app --port 8000
 (or:       scripts/run.sh)
@@ -9,15 +10,18 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 import threading
+import time
 import uuid
 import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-from . import analysis, git_service, store
+from . import analysis, clone as clone_service, git_service, store
 from .ingest import IngestError, extract_zip, find_repo_root
 
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB
@@ -28,6 +32,8 @@ store.init_dirs()
 
 _RUNNING_LOCK = threading.Lock()
 _RUNNING_ANALYSES: set[str] = set()
+_RUNNING_CLONES: dict[str, subprocess.Popen] = {}
+_CLONE_SAVE_INTERVAL = 0.4  # seconds between registry writes while cloning
 
 
 def _reset_stale_analysis() -> None:
@@ -38,7 +44,21 @@ def _reset_stale_analysis() -> None:
             store.upsert_repo(repo)
 
 
+def _reset_stale_clones() -> None:
+    """A clone cannot survive a process restart; fail it and drop partial data."""
+    for repo in store.list_repos():
+        if repo.get("status") != "cloning":
+            continue
+        shutil.rmtree(repo.get("root_dir", ""), ignore_errors=True)
+        message = "clone was interrupted by a server restart"
+        repo["status"] = "error"
+        repo["error"] = message
+        repo["clone"] = {"state": "error", "progress": 0, "phase": "failed", "error": message}
+        store.upsert_repo(repo)
+
+
 _reset_stale_analysis()
+_reset_stale_clones()
 
 
 def _slugify(value: str) -> str:
@@ -165,9 +185,91 @@ async def upload_repository(file: UploadFile = File(...)) -> dict:
         tmp_zip.unlink(missing_ok=True)
 
 
+class CloneRequest(BaseModel):
+    url: str = ""
+
+
+@app.post("/api/repositories/clone", status_code=202)
+def clone_repository(payload: CloneRequest) -> dict:
+    """Start a full-history clone of a public URL as a background job.
+
+    Returns the repository record immediately in ``cloning`` status; progress
+    is reported on the record's ``clone`` field and the repository joins the
+    regular pipeline (refresh / analyze / remove) once the clone completes.
+    """
+    try:
+        url = clone_service.validate_url(payload.url)
+    except clone_service.CloneError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    name = clone_service.repo_name_from_url(url)
+    repo_id = f"{_slugify(name)}-{uuid.uuid4().hex[:6]}"
+    root_dir = store.REPOS_DIR / repo_id
+    repo = {
+        "id": repo_id,
+        "name": name,
+        "source": f"git: {url}",
+        "url": url,
+        "added_at": store.utcnow_iso(),
+        "status": "cloning",
+        "error": None,
+        "root_dir": str(root_dir),
+        "path": str(root_dir),
+        "stats": None,
+        "analysis_ms": None,
+        "clone": {"state": "cloning", "progress": 0, "phase": "connecting", "error": None},
+    }
+    store.upsert_repo(repo)
+    threading.Thread(target=_run_clone, args=(repo_id, url), daemon=True).start()
+    return repo
+
+
+def _run_clone(repo_id: str, url: str) -> None:
+    """Background worker: clone with progress, then rescan like a ZIP ingest."""
+    repo = store.get_repo(repo_id)
+    if repo is None:
+        return
+    root_dir = Path(repo["root_dir"])
+    last_saved = [0.0]
+
+    def on_progress(percent: int, phase: str) -> None:
+        repo["clone"] = {
+            "state": "cloning", "progress": percent, "phase": phase, "error": None
+        }
+        now = time.monotonic()
+        if percent >= 100 or now - last_saved[0] >= _CLONE_SAVE_INTERVAL:
+            last_saved[0] = now
+            if store.get_repo(repo_id) is not None:
+                store.upsert_repo(repo)
+
+    def on_start(proc: subprocess.Popen) -> None:
+        _RUNNING_CLONES[repo_id] = proc
+
+    try:
+        clone_service.clone(url, root_dir, on_progress=on_progress, on_start=on_start)
+    except clone_service.CloneError as exc:
+        shutil.rmtree(root_dir, ignore_errors=True)
+        if store.get_repo(repo_id) is None:
+            return  # removed while cloning; nothing left to fail
+        repo["status"] = "error"
+        repo["error"] = str(exc)
+        repo["clone"] = {"state": "error", "progress": 0, "phase": "failed", "error": str(exc)}
+        store.upsert_repo(repo)
+        return
+    finally:
+        _RUNNING_CLONES.pop(repo_id, None)
+    if store.get_repo(repo_id) is None:
+        return  # removed while cloning; nothing to publish
+    repo["clone"] = {"state": "done", "progress": 100, "phase": "complete", "error": None}
+    repo["source"] = f"git: {url}"
+    _rescan(repo)
+
+
 @app.post("/api/repositories/{repo_id}/refresh")
 def refresh_repository(repo_id: str) -> dict:
-    return _rescan(_repo_or_404(repo_id))
+    repo = _repo_or_404(repo_id)
+    if repo.get("status") == "cloning":
+        raise HTTPException(status_code=409, detail="clone is still running for this repository")
+    return _rescan(repo)
 
 
 @app.delete("/api/repositories/{repo_id}")
@@ -175,6 +277,9 @@ def remove_repository(repo_id: str) -> dict:
     repo = store.remove_repo(repo_id)
     if repo is None:
         raise HTTPException(status_code=404, detail="repository not found")
+    proc = _RUNNING_CLONES.pop(repo_id, None)
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
     shutil.rmtree(repo.get("root_dir", ""), ignore_errors=True)
     return {"ok": True}
 
@@ -292,6 +397,27 @@ def analysis_dirs(repo_id: str, offset: int = 0, limit: int = 100) -> dict:
         "commit_count": page["commit_count"],
         "offset": offset,
         "limit": limit,
+        "items": page["items"],
+    }
+
+
+@app.get("/api/repositories/{repo_id}/analysis/authors")
+def analysis_authors(repo_id: str) -> dict:
+    """Per-author aggregates over H-bar (churn-descending), with ownership omega.
+
+    Identities are the raw author name/email pairs stored per fact; section
+    3.7 metrics (authorship indicator, author modifications, author churn,
+    ownership) are derived at read time so a later author merge can re-resolve
+    them without re-scanning history.
+    """
+    repo = _repo_or_404(repo_id)
+    analysis_state = repo.get("analysis") or {}
+    if analysis_state.get("state") != "ready":
+        raise HTTPException(status_code=409, detail="analysis has not been built yet")
+    page = analysis.read_author_metrics(_analysis_out_dir(repo))
+    return {
+        "total": page["total"],
+        "commit_count": page["commit_count"],
         "items": page["items"],
     }
 

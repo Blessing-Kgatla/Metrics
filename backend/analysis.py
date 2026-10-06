@@ -1,4 +1,4 @@
-"""Per-commit file metrics and derived aggregates (Phases 2-4).
+"""Per-commit facts, rollups and derived metrics (Phases 2-5).
 
 Walks non-merge history once with ``git log --no-merges --numstat`` and writes
 one JSON line per commit to ``analysis/facts.jsonl``:
@@ -14,7 +14,17 @@ path-ascending (pre-order tree). Directory sums are bottom-up over immediate
 children (direct files plus subdirectories), so a changed or deleted file
 contributes to every ancestor directory; a directory counts a modification
 once per commit in which any descendant changed. The root row "/" carries the
-repository metrics. Derived metrics (growth delta, churn lambda, frequency
+repository metrics.
+
+Rollups are additionally keyed by raw author identity (the author name/email
+stored verbatim on each fact): per-author commits and root modifications n,
+added/removed sums, plus per-file and per-directory rows. Author metrics
+follow the brief's section 3.7 (authorship indicator, author modifications,
+author churn, ownership omega = author churn / total churn); raw identities
+stay immutable so a later author merge can re-resolve every author metric
+additively at query time.
+
+Derived metrics (growth delta, churn lambda, frequency
 eta, rate rho) are computed when read and divided by |H|, so a later
 commit-set filter can re-derive them for an arbitrary subset of H-bar.
 
@@ -74,6 +84,9 @@ def build_facts(repo_root: Path, out_dir: Path, commit_count: int) -> dict:
     per_file: dict[str, dict] = {}
     dir_sums: dict[str, dict] = {}
     dir_commits: dict[str, int] = {}
+    authors: dict[tuple[str, str], dict] = {}
+    author_files: dict[tuple[str, str], dict[str, dict]] = {}
+    author_dirs: dict[tuple[str, str], dict[str, dict]] = {}
     binary_skipped = 0
     total_added = 0
     total_removed = 0
@@ -83,18 +96,50 @@ def build_facts(repo_root: Path, out_dir: Path, commit_count: int) -> dict:
         nonlocal records
         out.write(json.dumps(current, ensure_ascii=False, separators=(",", ":")) + "\n")
         records += 1
+        ident = (current["an"], current["ae"])
+        author = authors.get(ident)
+        if author is None:
+            author = authors[ident] = {
+                "name": ident[0],
+                "email": ident[1],
+                "commits": 0,
+                "n": 0,
+                "added": 0,
+                "removed": 0,
+            }
+        author["commits"] += 1
+        a_files = author_files.setdefault(ident, {})
+        a_dirs = author_dirs.setdefault(ident, {})
         touched: set[str] = set()
         for fpath, f_added, f_removed in current["f"]:
+            changed = f_added + f_removed > 0
+            author["added"] += f_added
+            author["removed"] += f_removed
             for directory in _ancestor_dirs(fpath):
                 sums = dir_sums.get(directory)
                 if sums is None:
                     sums = dir_sums[directory] = {"added": 0, "removed": 0}
                 sums["added"] += f_added
                 sums["removed"] += f_removed
-                if f_added + f_removed > 0:
+                a_row = a_dirs.get(directory)
+                if a_row is None:
+                    a_row = a_dirs[directory] = {"added": 0, "removed": 0, "n": 0}
+                a_row["added"] += f_added
+                a_row["removed"] += f_removed
+                if changed:
                     touched.add(directory)
+            f_row = a_files.get(fpath)
+            if f_row is None:
+                f_row = a_files[fpath] = {"added": 0, "removed": 0, "n": 0}
+            f_row["added"] += f_added
+            f_row["removed"] += f_removed
+            if changed:
+                f_row["n"] += 1
+        if touched:
+            author["n"] += 1
         for directory in touched:
             dir_commits[directory] = dir_commits.get(directory, 0) + 1
+            a_dirs[directory]["n"] += 1
 
     if commit_count > 0:
         cmd = [
@@ -202,8 +247,12 @@ def build_facts(repo_root: Path, out_dir: Path, commit_count: int) -> dict:
     }
     (out_dir / META_NAME).write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
+    ident_order = sorted(
+        authors.items(),
+        key=lambda item: (-(item[1]["added"] + item[1]["removed"]), item[0][0], item[0][1]),
+    )
     aggregates = {
-        "version": 2,
+        "version": 3,
         "commit_count": records,
         "files": sorted(
             (
@@ -229,6 +278,29 @@ def build_facts(repo_root: Path, out_dir: Path, commit_count: int) -> dict:
             ),
             key=lambda row: row["path"],
         ),
+        "authors": [entry for _ident, entry in ident_order],
+        "author_files": [
+            {
+                "a": index,
+                "path": path,
+                "added": row["added"],
+                "removed": row["removed"],
+                "n": row["n"],
+            }
+            for index, (ident, _entry) in enumerate(ident_order)
+            for path, row in sorted(author_files.get(ident, {}).items())
+        ],
+        "author_dirs": [
+            {
+                "a": index,
+                "path": directory,
+                "added": row["added"],
+                "removed": row["removed"],
+                "n": row["n"],
+            }
+            for index, (ident, _entry) in enumerate(ident_order)
+            for directory, row in sorted(author_dirs.get(ident, {}).items())
+        ],
     }
     (out_dir / AGG_NAME).write_text(
         json.dumps(aggregates, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
@@ -337,3 +409,49 @@ def read_dir_metrics(out_dir: Path, offset: int, limit: int) -> dict:
     and the root row ("/") carries the repository metrics.
     """
     return _read_aggregate_page(out_dir, "dirs", offset, limit)
+
+
+def read_author_metrics(out_dir: Path) -> dict:
+    """Return per-author aggregates over the commit set H-bar.
+
+    Follows the assignment's section 3.7: commits counts how many h in H-bar
+    have h[a] = a (including empty commits), n is the author-modifications
+    count for the repository root (commits by a with any churn), and omega is
+    the author's share of total churn. Rows stay keyed by the raw name/email
+    identity so a later author merge can re-resolve every author metric
+    additively at query time.
+    """
+    agg_path = out_dir / AGG_NAME
+    if not agg_path.exists():
+        return {"total": 0, "commit_count": 0, "items": []}
+    try:
+        data = json.loads(agg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"total": 0, "commit_count": 0, "items": []}
+    rows = data.get("authors") or []
+    commit_count = int(data.get("commit_count") or 0)
+    file_counts: dict[int, int] = {}
+    for row in data.get("author_files") or []:
+        index = int(row.get("a", -1))
+        file_counts[index] = file_counts.get(index, 0) + 1
+    total_churn = sum(int(row.get("added", 0)) + int(row.get("removed", 0)) for row in rows)
+    items: list[dict] = []
+    for index, row in enumerate(rows):
+        added = int(row.get("added", 0))
+        removed = int(row.get("removed", 0))
+        churn = added + removed
+        items.append(
+            {
+                "name": row.get("name", ""),
+                "email": row.get("email", ""),
+                "commits": int(row.get("commits", 0)),
+                "n": int(row.get("n", 0)),
+                "added": added,
+                "removed": removed,
+                "growth": added - removed,
+                "churn": churn,
+                "files": file_counts.get(index, 0),
+                "omega": (churn / total_churn) if total_churn else 0.0,
+            }
+        )
+    return {"total": len(items), "commit_count": commit_count, "items": items}

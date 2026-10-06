@@ -1,6 +1,7 @@
 'use strict';
 
-/* RepoLens frontend — Phase 1: app shell, ZIP ingestion, basic repository info. */
+/* RepoLens frontend — app shell, ZIP ingestion (Phase 1), history metrics
+   (Phases 2-5), and remote URL cloning (Phase 6). */
 
 const API = '/api';
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -33,10 +34,13 @@ const state = {
   summary: null, // { repoId, enriched, commits, authors, files, filesFilter }
   analysis: null, // { repoId, state, meta, error }
   analysisPoll: null,
+  clonePoll: null,
+  cloneViewPoll: null,
   loadToken: 0,
 };
 
 let uploadXhr = null;
+let reposClonePoll = null;
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -174,7 +178,7 @@ function renderTopbar() {
   const options = state.repos.length
     ? state.repos.map((r) => (
       `<option value="${esc(r.id)}"${r.id === state.currentId ? ' selected' : ''}>` +
-      `${esc(r.name)}${r.status === 'error' ? ' — error' : ''}</option>`
+      `${esc(r.name)}${r.status === 'error' ? ' — error' : r.status === 'cloning' ? ' — cloning' : ''}</option>`
     )).join('')
     : '<option>No repositories</option>';
   [$('#repoSelectTop'), $('#repoSelectFilter')].forEach((sel) => {
@@ -219,6 +223,11 @@ function emptyStateHTML() {
 
 function renderSummary(repo) {
   const content = $('#content');
+  if (repo.status === 'cloning') {
+    content.innerHTML = cloneProgressHTML(repo);
+    scheduleCloneViewPoll(repo);
+    return;
+  }
   if (repo.status === 'error') {
     content.innerHTML = repoErrorHTML(repo);
     const btn = $('#retryScanBtn');
@@ -342,6 +351,60 @@ function repoErrorHTML(repo) {
   </div>`;
 }
 
+function cloneProgressHTML(repo) {
+  const clone = repo.clone || {};
+  const pct = Math.max(0, Math.min(100, clone.progress || 0));
+  return `
+  <div class="view-header">
+    <div>
+      <h2 class="section-title">${esc(repo.name)}</h2>
+      <div class="section-sub" title="${esc(repo.url || repo.source)}">${esc(repo.source)}</div>
+    </div>
+  </div>
+  <div class="clone-card">
+    <strong>Cloning in progress…</strong>
+    <div class="muted" style="margin-top:6px" id="cloneViewStatus">${pct}% — ${esc(clone.phase || 'connecting')}</div>
+    <div class="progress-track"><div class="progress-fill" id="cloneViewFill" style="width:${pct}%"></div></div>
+  </div>`;
+}
+
+function scheduleCloneViewPoll(repo, tries = 0) {
+  stopCloneViewPoll();
+  if (tries > 3000) return; // ~100 min at 2 s — plenty for the largest targets
+  state.cloneViewPoll = setTimeout(async () => {
+    state.cloneViewPoll = null;
+    if (state.currentId !== repo.id || state.view !== 'summary') return;
+    try {
+      const rec = await api(`/repositories/${repo.id}`);
+      if (state.currentId !== repo.id || state.view !== 'summary') return;
+      const idx = state.repos.findIndex((r) => r.id === repo.id);
+      if (idx >= 0) state.repos[idx] = rec;
+      if (rec.status === 'cloning') {
+        const clone = rec.clone || {};
+        const pct = Math.max(0, Math.min(100, clone.progress || 0));
+        const status = $('#cloneViewStatus');
+        const fill = $('#cloneViewFill');
+        if (status) status.textContent = `${pct}% — ${clone.phase || 'connecting'}`;
+        if (fill) fill.style.width = `${pct}%`;
+        scheduleCloneViewPoll(rec, tries + 1);
+      } else {
+        renderTopbar();
+        renderSummary(rec);
+        if (rec.status === 'ready') toast(`Cloned "${rec.name}"`, 'success');
+      }
+    } catch {
+      scheduleCloneViewPoll(repo, tries + 1);
+    }
+  }, 2000);
+}
+
+function stopCloneViewPoll() {
+  if (state.cloneViewPoll) {
+    clearTimeout(state.cloneViewPoll);
+    state.cloneViewPoll = null;
+  }
+}
+
 function wireSummary() {
   const body = $('#commitsBody');
   if (body && !body.dataset.bound) {
@@ -389,10 +452,11 @@ async function loadRepoData(repo) {
 async function loadSummaryData(repo, token) {
   const enriched = !!(state.analysis && state.analysis.repoId === repo.id && state.analysis.state === 'ready');
   const endpoint = enriched ? 'analysis/commits' : 'commits';
+  const authorsEndpoint = enriched ? 'analysis/authors' : 'authors';
   const filesEndpoint = enriched ? 'analysis/files?offset=0&limit=500' : 'files';
   const requests = [
     api(`/repositories/${repo.id}/${endpoint}?offset=0&limit=50`),
-    api(`/repositories/${repo.id}/authors`),
+    api(`/repositories/${repo.id}/${authorsEndpoint}`),
     api(`/repositories/${repo.id}/${filesEndpoint}`),
   ];
   if (enriched) requests.push(api(`/repositories/${repo.id}/analysis/dirs?offset=0&limit=500`));
@@ -596,6 +660,21 @@ function paintAuthors() {
   const items = sum.authors.items || [];
   if (!items.length) {
     body.innerHTML = '<div class="faint" style="padding:16px">No authors found.</div>';
+  } else if (sum.enriched) {
+    body.innerHTML = items.map((a) => {
+      const share = Math.round(a.omega * 100);
+      return `
+      <div class="author-row" title="${esc(a.name)} — λ ${fmtInt(a.churn)} churn · +${fmtInt(a.added)} −${fmtInt(a.removed)} lines · ${fmtInt(a.commits)} commits · ${fmtInt(a.files)} files">
+        <div class="avatar" style="background:${avatarColor(a.email || a.name)}">${esc(initials(a.name))}</div>
+        <div class="author-meta">
+          <div class="author-name" title="${esc(a.name)}">${esc(a.name)}</div>
+          <div class="author-email" title="${esc(a.email)}">${esc(a.email || 'no email')}</div>
+          <div class="cell-sub">${fmtInt(a.commits)} commits · ${fmtInt(a.files)} files</div>
+          <div class="share-bar"><div style="width:${share}%"></div></div>
+        </div>
+        <div class="author-count">${fmtInt(a.churn)}<div class="cell-sub">ω ${share}%</div></div>
+      </div>`;
+    }).join('');
   } else {
     const total = items.reduce((acc, a) => acc + a.commits, 0) || 1;
     body.innerHTML = items.map((a) => {
@@ -613,7 +692,12 @@ function paintAuthors() {
     }).join('');
   }
   const meta = $('#authorsMeta');
-  if (meta) meta.textContent = `${fmtInt(items.length)} ${items.length === 1 ? 'identity' : 'identities'}`;
+  if (meta) {
+    meta.textContent = `${fmtInt(items.length)} ${items.length === 1 ? 'identity' : 'identities'}`;
+    meta.title = sum.enriched
+      ? 'Ownership ω — author churn ÷ total repository churn over non-merge commits'
+      : 'All commits on the current branch, grouped by git shortlog';
+  }
 }
 
 function paintFiles() {
@@ -769,6 +853,22 @@ function renderRepositories() {
   </div>`;
   $('#viewAddRepoBtn').addEventListener('click', openAddModal);
   $('#repoGrid').addEventListener('click', onRepoGridClick);
+  scheduleReposClonePoll();
+}
+
+function scheduleReposClonePoll() {
+  if (reposClonePoll) {
+    clearTimeout(reposClonePoll);
+    reposClonePoll = null;
+  }
+  if (!state.repos.some((r) => r.status === 'cloning')) return;
+  reposClonePoll = setTimeout(async () => {
+    reposClonePoll = null;
+    if (state.view !== 'repositories') return;
+    await loadRepos(true);
+    if (state.view !== 'repositories') return;
+    renderRepositories();
+  }, 2500);
 }
 
 function analysisNote(repo) {
@@ -781,11 +881,15 @@ function analysisNote(repo) {
 
 function repoCardHTML(repo) {
   const s = repo.stats || {};
+  const cloning = repo.status === 'cloning';
+  const clonePct = cloning ? Math.max(0, Math.min(100, (repo.clone && repo.clone.progress) || 0)) : 0;
   const statusTag = repo.status === 'ready'
     ? '<span class="tag ok">ready</span>'
     : repo.status === 'error'
       ? '<span class="tag err">error</span>'
-      : `<span class="tag">${esc(repo.status)}</span>`;
+      : cloning
+        ? `<span class="tag" title="${esc((repo.clone && repo.clone.phase) || 'cloning')}">cloning ${clonePct}%</span>`
+        : `<span class="tag">${esc(repo.status)}</span>`;
   return `
   <article class="repo-card" data-id="${esc(repo.id)}">
     <div class="repo-card-head">
@@ -804,7 +908,7 @@ function repoCardHTML(repo) {
     <div class="repo-path" title="Click to copy path">${esc(repo.path)}</div>
     <div class="repo-actions">
       <button class="btn primary" data-action="open" ${repo.status !== 'ready' ? 'disabled' : ''}>Open</button>
-      <button class="btn ghost" data-action="refresh">Refresh Scan</button>
+      <button class="btn ghost" data-action="refresh" ${cloning ? 'disabled' : ''}>Refresh Scan</button>
       <button class="btn danger" data-action="remove">Remove</button>
     </div>
   </article>`;
@@ -876,6 +980,7 @@ async function onRepoGridClick(e) {
 function selectRepo(id) {
   if (!state.repos.some((r) => r.id === id)) return;
   stopAnalysisPoll();
+  stopCloneViewPoll();
   state.currentId = id;
   persistCurrent();
   state.summary = null;
@@ -883,13 +988,13 @@ function selectRepo(id) {
   render();
 }
 
-async function loadRepos() {
+async function loadRepos(silent = false) {
   setBusy(1);
   try {
     const data = await api('/repositories');
     state.repos = data.repos || [];
   } catch (err) {
-    toast(err.message, 'error');
+    if (!silent) toast(err.message, 'error');
   } finally {
     setBusy(-1);
   }
@@ -921,16 +1026,15 @@ function modalHTML() {
   <div class="modal-overlay" id="modalOverlay">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
       <h2 id="modalTitle">Add repository</h2>
-      <p class="modal-sub">Upload a ZIP containing a repository. The archive may hold the repository folder itself or its contents — as long as the <code>.git</code> file or directory is inside.</p>
+      <p class="modal-sub">Upload a ZIP containing a repository, or clone a public Git URL. The archive may hold the repository folder itself or its contents — as long as the <code>.git</code> file or directory is inside.</p>
       <div class="modal-drop" id="modalDrop">
         ${ICONS.upload}
         <div>Drag and drop a <strong>.zip</strong> here, or <span class="link">browse</span></div>
         <input type="file" id="fileInput" accept=".zip,application/zip" hidden>
       </div>
-      <div class="url-row" title="Remote cloning arrives with Phase 6">
-        <input class="filter-input" type="text" placeholder="https://github.com/owner/repo.git" disabled>
-        <button class="btn" disabled>Clone</button>
-        <span class="tag">Phase 6</span>
+      <div class="url-row">
+        <input class="filter-input" type="text" id="cloneUrl" placeholder="https://github.com/owner/repo.git" autocomplete="off" spellcheck="false">
+        <button class="btn" id="cloneBtn">Clone</button>
       </div>
       <div id="uploadProgress" hidden>
         <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
@@ -970,6 +1074,17 @@ function openAddModal() {
   $('#modalOverlay').addEventListener('mousedown', (e) => {
     if (e.target === $('#modalOverlay')) cancelModal();
   });
+  const cloneBtn = $('#cloneBtn');
+  const cloneInput = $('#cloneUrl');
+  if (cloneBtn && cloneInput) {
+    cloneBtn.addEventListener('click', () => startClone(cloneInput.value));
+    cloneInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        startClone(cloneInput.value);
+      }
+    });
+  }
 }
 
 function closeModal() {
@@ -977,6 +1092,7 @@ function closeModal() {
 }
 
 function cancelModal() {
+  stopClonePoll();
   if (uploadXhr) {
     try { uploadXhr.abort(); } catch { /* already finished */ }
     uploadXhr = null;
@@ -1069,6 +1185,111 @@ function startUpload(file) {
   const fd = new FormData();
   fd.append('file', file, file.name);
   xhr.send(fd);
+}
+
+/* ------------------------------------------------------------------ */
+/* remote URL cloning (Phase 6)                                        */
+/* ------------------------------------------------------------------ */
+
+function stopClonePoll() {
+  if (state.clonePoll) {
+    clearTimeout(state.clonePoll);
+    state.clonePoll = null;
+  }
+}
+
+async function startClone(rawUrl) {
+  const url = String(rawUrl || '').trim();
+  if (!url) {
+    setUploadError('Enter a repository URL to clone.');
+    return;
+  }
+  const progress = $('#uploadProgress');
+  const fill = $('#progressFill');
+  const status = $('#uploadStatus');
+  const cloneBtn = $('#cloneBtn');
+  const cancel = $('#modalCancel');
+  if (!progress || !fill || !status) return;
+
+  progress.hidden = false;
+  fill.classList.remove('indeterminate');
+  fill.style.background = '';
+  fill.style.width = '0%';
+  status.classList.remove('error');
+  status.textContent = 'Contacting remote…';
+  if (cloneBtn) {
+    cloneBtn.disabled = true;
+    cloneBtn.textContent = 'Cloning…';
+  }
+  if (cancel) cancel.textContent = 'Close';
+
+  let repo;
+  try {
+    repo = await api('/repositories/clone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+  } catch (err) {
+    if (cloneBtn) {
+      cloneBtn.disabled = false;
+      cloneBtn.textContent = 'Clone';
+    }
+    setUploadError(err.message);
+    return;
+  }
+  toast(`Cloning "${repo.name}"…`);
+  pollClone(repo);
+}
+
+function pollClone(repo, tries = 0) {
+  stopClonePoll();
+  if (tries > 3000) return; // ~60 min at 1.2 s — plenty for the largest targets
+  state.clonePoll = setTimeout(async () => {
+    state.clonePoll = null;
+    if (!$('#modalOverlay')) return; // modal closed; the job keeps running server-side
+    let rec;
+    try {
+      rec = await api(`/repositories/${repo.id}`);
+    } catch {
+      pollClone(repo, tries + 1);
+      return;
+    }
+    const clone = rec.clone || {};
+    const fill = $('#progressFill');
+    const status = $('#uploadStatus');
+    if (fill && status && !status.classList.contains('error')) {
+      const pct = Math.max(2, Math.min(100, clone.progress || 0));
+      fill.classList.remove('indeterminate');
+      fill.style.width = `${pct}%`;
+      status.textContent = rec.status === 'ready' || clone.state === 'done'
+        ? 'Preparing repository…'
+        : `Cloning… ${pct}% — ${clone.phase || 'connecting'}`;
+    }
+    if (rec.status === 'ready') {
+      finishCloneModal(rec);
+      return;
+    }
+    if (rec.status === 'error') {
+      setUploadError(rec.error || clone.error || 'Clone failed.');
+      return;
+    }
+    pollClone(repo, tries + 1);
+  }, 1200);
+}
+
+async function finishCloneModal(repo) {
+  stopClonePoll();
+  closeModal();
+  toast(`Cloned "${repo.name}"`, 'success');
+  await loadRepos();
+  stopAnalysisPoll();
+  state.currentId = repo.id;
+  persistCurrent();
+  state.view = 'summary';
+  state.summary = null;
+  state.analysis = null;
+  render();
 }
 
 /* ------------------------------------------------------------------ */
