@@ -1,4 +1,4 @@
-"""Per-commit file metrics (Phase 2): the per-repository facts store.
+"""Per-commit file metrics and derived aggregates (Phases 2-4).
 
 Walks non-merge history once with ``git log --no-merges --numstat`` and writes
 one JSON line per commit to ``analysis/facts.jsonl``:
@@ -6,6 +6,17 @@ one JSON line per commit to ``analysis/facts.jsonl``:
     {"h": <hash>, "an": <author name>, "ae": <author email>,
      "cd": <committer date>, "ad": <author date>, "s": <subject>,
      "f": [[<path>, <lines added>, <lines removed>], ...]}
+
+The same pass accumulates per-file and per-directory rollups over the commit
+set H-bar into ``analysis/aggregates.json``: raw sums (added, removed,
+modifications n) per path, files ordered by churn and directories
+path-ascending (pre-order tree). Directory sums are bottom-up over immediate
+children (direct files plus subdirectories), so a changed or deleted file
+contributes to every ancestor directory; a directory counts a modification
+once per commit in which any descendant changed. The root row "/" carries the
+repository metrics. Derived metrics (growth delta, churn lambda, frequency
+eta, rate rho) are computed when read and divided by |H|, so a later
+commit-set filter can re-derive them for an arbitrary subset of H-bar.
 
 Rules applied here, per the assignment's commit model:
 - merge commits are excluded (the facts store covers H-bar);
@@ -25,6 +36,7 @@ from . import git_service, store
 
 FACTS_NAME = "facts.jsonl"
 META_NAME = "meta.json"
+AGG_NAME = "aggregates.json"
 _MAX_BUILD_SECONDS = 900
 
 _HEADER_MARK = "\x01"
@@ -32,6 +44,17 @@ _FIELD_SEP = "\x1f"
 _HEADER_FORMAT = (
     f"%x01%H{_FIELD_SEP}%an{_FIELD_SEP}%ae{_FIELD_SEP}%cI{_FIELD_SEP}%aI{_FIELD_SEP}%s"
 )
+
+
+def _ancestor_dirs(path: str) -> list[str]:
+    """Return every ancestor directory of a repo-relative path (root "/" last)."""
+    dirs: list[str] = []
+    idx = path.rfind("/")
+    while idx != -1:
+        dirs.append(path[:idx])
+        idx = path.rfind("/", 0, idx)
+    dirs.append("/")
+    return dirs
 
 
 class AnalysisError(Exception):
@@ -48,6 +71,9 @@ def build_facts(repo_root: Path, out_dir: Path, commit_count: int) -> dict:
 
     records = 0
     files_touched: set[str] = set()
+    per_file: dict[str, dict] = {}
+    dir_sums: dict[str, dict] = {}
+    dir_commits: dict[str, int] = {}
     binary_skipped = 0
     total_added = 0
     total_removed = 0
@@ -57,6 +83,18 @@ def build_facts(repo_root: Path, out_dir: Path, commit_count: int) -> dict:
         nonlocal records
         out.write(json.dumps(current, ensure_ascii=False, separators=(",", ":")) + "\n")
         records += 1
+        touched: set[str] = set()
+        for fpath, f_added, f_removed in current["f"]:
+            for directory in _ancestor_dirs(fpath):
+                sums = dir_sums.get(directory)
+                if sums is None:
+                    sums = dir_sums[directory] = {"added": 0, "removed": 0}
+                sums["added"] += f_added
+                sums["removed"] += f_removed
+                if f_added + f_removed > 0:
+                    touched.add(directory)
+        for directory in touched:
+            dir_commits[directory] = dir_commits.get(directory, 0) + 1
 
     if commit_count > 0:
         cmd = [
@@ -123,6 +161,13 @@ def build_facts(repo_root: Path, out_dir: Path, commit_count: int) -> dict:
                             files_touched.add(path)
                             total_added += added
                             total_removed += removed
+                            rollup = per_file.get(path)
+                            if rollup is None:
+                                rollup = per_file[path] = {"added": 0, "removed": 0, "n": 0}
+                            rollup["added"] += added
+                            rollup["removed"] += removed
+                            if added + removed > 0:
+                                rollup["n"] += 1
                     if current is not None:
                         flush(out)
                     proc.wait()
@@ -156,6 +201,38 @@ def build_facts(repo_root: Path, out_dir: Path, commit_count: int) -> dict:
         "rename_detection": False,
     }
     (out_dir / META_NAME).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    aggregates = {
+        "version": 2,
+        "commit_count": records,
+        "files": sorted(
+            (
+                {
+                    "path": path,
+                    "added": rollup["added"],
+                    "removed": rollup["removed"],
+                    "n": rollup["n"],
+                }
+                for path, rollup in per_file.items()
+            ),
+            key=lambda row: (-(row["added"] + row["removed"]), row["path"]),
+        ),
+        "dirs": sorted(
+            (
+                {
+                    "path": directory,
+                    "added": sums["added"],
+                    "removed": sums["removed"],
+                    "n": dir_commits.get(directory, 0),
+                }
+                for directory, sums in dir_sums.items()
+            ),
+            key=lambda row: row["path"],
+        ),
+    }
+    (out_dir / AGG_NAME).write_text(
+        json.dumps(aggregates, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+    )
     return meta
 
 
@@ -199,3 +276,64 @@ def read_facts_page(out_dir: Path, offset: int, limit: int) -> list[dict]:
             except json.JSONDecodeError:
                 continue
     return items
+
+
+def _metric_item(row: dict, commit_count: int) -> dict:
+    """Convert a stored raw aggregate row into API shape with derived metrics.
+
+    Derived metrics follow the assignment's formulas: delta = added - removed,
+    lambda = added + removed, eta = n / |H| and rho = churn / |H|, computed
+    against the stored commit-set size (H = H-bar until the filtering phase).
+    """
+    added = int(row.get("added", 0))
+    removed = int(row.get("removed", 0))
+    n = int(row.get("n", 0))
+    churn = added + removed
+    return {
+        "path": row.get("path", ""),
+        "added": added,
+        "removed": removed,
+        "growth": added - removed,
+        "churn": churn,
+        "n": n,
+        "eta": (n / commit_count) if commit_count else 0.0,
+        "rho": (churn / commit_count) if commit_count else 0.0,
+    }
+
+
+def _read_aggregate_page(out_dir: Path, key: str, offset: int, limit: int) -> dict:
+    """Return a page of stored aggregate rows (``"files"`` or ``"dirs"``)."""
+    agg_path = out_dir / AGG_NAME
+    if not agg_path.exists():
+        return {"total": 0, "commit_count": 0, "items": []}
+    try:
+        data = json.loads(agg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"total": 0, "commit_count": 0, "items": []}
+    rows = data.get(key) or []
+    commit_count = int(data.get("commit_count") or 0)
+    return {
+        "total": len(rows),
+        "commit_count": commit_count,
+        "items": [_metric_item(row, commit_count) for row in rows[offset : offset + limit]],
+    }
+
+
+def read_file_metrics(out_dir: Path, offset: int, limit: int) -> dict:
+    """Return a page of per-file aggregate metrics over the commit set H-bar.
+
+    Rows are stored churn-descending at build time (read_file_metrics mirrors
+    _metric_item's formulas; see its docstring for the derived metrics).
+    """
+    return _read_aggregate_page(out_dir, "files", offset, limit)
+
+
+def read_dir_metrics(out_dir: Path, offset: int, limit: int) -> dict:
+    """Return a page of per-directory rollups over the commit set H-bar.
+
+    Each directory sums its immediate children (direct files plus
+    subdirectories, bottom-up), so a changed or deleted file contributes to
+    every ancestor directory. Rows are stored path-ascending (pre-order tree)
+    and the root row ("/") carries the repository metrics.
+    """
+    return _read_aggregate_page(out_dir, "dirs", offset, limit)

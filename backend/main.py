@@ -1,5 +1,5 @@
 """RepoLens web app: dashboard shell + ZIP ingestion (Phase 1), per-commit
-file metrics and analysis pipeline (Phase 2).
+file metrics and the analysis pipeline (Phases 2-4).
 
 Run with:  python3 -m uvicorn backend.main:app --port 8000
 (or:       scripts/run.sh)
@@ -251,6 +251,48 @@ def analysis_commits(repo_id: str, offset: int = 0, limit: int = 50) -> dict:
         "offset": offset,
         "limit": limit,
         "items": items,
+    }
+
+
+@app.get("/api/repositories/{repo_id}/analysis/files")
+def analysis_files(repo_id: str, offset: int = 0, limit: int = 100) -> dict:
+    """Per-file aggregates over H-bar (churn-descending), with derived metrics."""
+    repo = _repo_or_404(repo_id)
+    analysis_state = repo.get("analysis") or {}
+    if analysis_state.get("state") != "ready":
+        raise HTTPException(status_code=409, detail="analysis has not been built yet")
+    offset = max(0, offset)
+    limit = max(1, min(limit, 1000))
+    page = analysis.read_file_metrics(_analysis_out_dir(repo), offset, limit)
+    return {
+        "total": page["total"],
+        "commit_count": page["commit_count"],
+        "offset": offset,
+        "limit": limit,
+        "items": page["items"],
+    }
+
+
+@app.get("/api/repositories/{repo_id}/analysis/dirs")
+def analysis_dirs(repo_id: str, offset: int = 0, limit: int = 100) -> dict:
+    """Per-directory rollups over H-bar (pre-order tree), with derived metrics.
+
+    Each row aggregates its immediate children bottom-up; the root row ("/")
+    carries the repository metrics for the commit set H.
+    """
+    repo = _repo_or_404(repo_id)
+    analysis_state = repo.get("analysis") or {}
+    if analysis_state.get("state") != "ready":
+        raise HTTPException(status_code=409, detail="analysis has not been built yet")
+    offset = max(0, offset)
+    limit = max(1, min(limit, 1000))
+    page = analysis.read_dir_metrics(_analysis_out_dir(repo), offset, limit)
+    return {
+        "total": page["total"],
+        "commit_count": page["commit_count"],
+        "offset": offset,
+        "limit": limit,
+        "items": page["items"],
     }
 
 

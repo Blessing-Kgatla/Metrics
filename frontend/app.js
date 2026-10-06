@@ -308,11 +308,18 @@ function summaryHTML(repo) {
       </section>
       <section class="panel">
         <div class="panel-header">
-          <span class="panel-title">Tracked Files</span>
+          <span class="panel-title" id="filesTitle">Tracked Files</span>
           <input id="filesSearch" class="search" type="text" placeholder="Filter paths…" autocomplete="off">
           <span class="panel-meta" id="filesMeta"></span>
         </div>
         <div class="panel-body" id="filesBody" style="max-height:300px"></div>
+      </section>
+      <section class="panel" id="dirsPanel" hidden>
+        <div class="panel-header">
+          <span class="panel-title">Directories</span>
+          <span class="panel-meta" id="dirsMeta"></span>
+        </div>
+        <div class="panel-body" id="dirsBody" style="max-height:260px"></div>
       </section>
     </div>
   </div>`;
@@ -382,14 +389,17 @@ async function loadRepoData(repo) {
 async function loadSummaryData(repo, token) {
   const enriched = !!(state.analysis && state.analysis.repoId === repo.id && state.analysis.state === 'ready');
   const endpoint = enriched ? 'analysis/commits' : 'commits';
-  const [commits, authors, files] = await Promise.all([
+  const filesEndpoint = enriched ? 'analysis/files?offset=0&limit=500' : 'files';
+  const requests = [
     api(`/repositories/${repo.id}/${endpoint}?offset=0&limit=50`),
     api(`/repositories/${repo.id}/authors`),
-    api(`/repositories/${repo.id}/files`),
-  ]);
+    api(`/repositories/${repo.id}/${filesEndpoint}`),
+  ];
+  if (enriched) requests.push(api(`/repositories/${repo.id}/analysis/dirs?offset=0&limit=500`));
+  const [commits, authors, files, dirs] = await Promise.all(requests);
   if (state.currentId !== repo.id) return;
   if (token !== undefined && token !== state.loadToken) return;
-  state.summary = { repoId: repo.id, enriched, commits, authors, files, filesFilter: '' };
+  state.summary = { repoId: repo.id, enriched, commits, authors, files, dirs, filesFilter: '' };
   if (state.view === 'summary') paintSummary(repo);
   paintAnalysisBar(repo);
 }
@@ -503,6 +513,7 @@ function paintSummary(repo) {
   paintCommits();
   paintAuthors();
   paintFiles();
+  paintDirectories();
 }
 
 function paintCommits() {
@@ -610,8 +621,20 @@ function paintFiles() {
   if (!sum) return;
   const body = $('#filesBody');
   if (!body) return;
+  const title = $('#filesTitle');
+  if (title) title.textContent = sum.enriched ? 'File Metrics' : 'Tracked Files';
   const filter = (sum.filesFilter || '').trim().toLowerCase();
   const all = sum.files.items || [];
+  const meta = $('#filesMeta');
+  if (sum.enriched) {
+    const matched = filter ? all.filter((f) => f.path.toLowerCase().includes(filter)) : all;
+    body.innerHTML = fileMetricsHTML(matched);
+    if (meta) {
+      meta.textContent = `${fmtInt(matched.length)} / ${fmtInt(sum.files.total)}${sum.files.total > all.length ? '+' : ''}`;
+      meta.title = 'Per-file metrics over non-merge commits · binary files are not measured';
+    }
+    return;
+  }
   const matched = filter ? all.filter((p) => p.toLowerCase().includes(filter)) : all;
   const shown = matched.slice(0, 300);
   body.innerHTML = shown.length
@@ -621,10 +644,87 @@ function paintFiles() {
     body.innerHTML +=
       `<div class="faint" style="padding:8px 16px; font-size:12px">… ${fmtInt(matched.length - shown.length)} more — refine your filter</div>`;
   }
-  const meta = $('#filesMeta');
   if (meta) {
     meta.textContent = `${fmtInt(matched.length)} / ${fmtInt(sum.files.total)}${sum.files.truncated ? '+' : ''}`;
+    meta.title = 'Tracked files in the current revision';
   }
+}
+
+function fileMetricsHTML(rows) {
+  if (!rows.length) return '<div class="faint" style="padding:16px">No measured file changes.</div>';
+  return `
+  <table class="table metrics-table">
+    <thead>
+      <tr>
+        <th>File</th>
+        <th class="num" style="width:44px" title="Churn λ — added + removed lines">λ</th>
+        <th class="num" style="width:36px" title="Modifications n — commits that changed the file">n</th>
+        <th class="num" style="width:46px" title="Modification frequency η — n ÷ |H|">η</th>
+        <th class="num" style="width:46px" title="Churn rate ρ — λ ÷ |H|">ρ</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows.map((f) => `
+      <tr title="${esc(f.path)} — +${fmtInt(f.added)} −${fmtInt(f.removed)} lines · δ ${f.growth >= 0 ? '+' : ''}${fmtInt(f.growth)}">
+        <td>${esc(f.path)}</td>
+        <td class="num mono">${fmtInt(f.churn)}</td>
+        <td class="num mono">${fmtInt(f.n)}</td>
+        <td class="num mono">${f.eta.toFixed(2)}</td>
+        <td class="num mono">${f.rho.toFixed(2)}</td>
+      </tr>`).join('')}
+    </tbody>
+  </table>`;
+}
+
+function paintDirectories() {
+  const sum = state.summary;
+  if (!sum) return;
+  const panel = $('#dirsPanel');
+  const body = $('#dirsBody');
+  if (!panel || !body) return;
+  if (!sum.dirs) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const items = sum.dirs.items || [];
+  body.innerHTML = dirsTableHTML(items);
+  const meta = $('#dirsMeta');
+  if (meta) {
+    meta.textContent = `${fmtInt(items.length)} / ${fmtInt(sum.dirs.total)}`;
+    meta.title = 'Directory rollups over immediate children, bottom-up · "/" is the repository root (repository metrics)';
+  }
+}
+
+function dirsTableHTML(rows) {
+  if (!rows.length) return '<div class="faint" style="padding:16px">No directory changes.</div>';
+  return `
+  <table class="table metrics-table">
+    <thead>
+      <tr>
+        <th>Directory</th>
+        <th class="num" style="width:44px" title="Churn λ — added + removed lines">λ</th>
+        <th class="num" style="width:36px" title="Modifications n — commits in which anything under this directory changed">n</th>
+        <th class="num" style="width:46px" title="Modification frequency η — n ÷ |H|">η</th>
+        <th class="num" style="width:46px" title="Churn rate ρ — λ ÷ |H|">ρ</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows.map((d) => {
+        const root = d.path === '/';
+        const depth = root ? 0 : d.path.split('/').length;
+        const label = root ? '/' : `${d.path}/`;
+        return `
+      <tr class="${root ? 'dir-root' : ''}" title="${esc(d.path)} — +${fmtInt(d.added)} −${fmtInt(d.removed)} lines · δ ${d.growth >= 0 ? '+' : ''}${fmtInt(d.growth)}${root ? ' · repository metrics' : ''}">
+        <td style="padding-left:${16 + depth * 14}px">${esc(label)}</td>
+        <td class="num mono">${fmtInt(d.churn)}</td>
+        <td class="num mono">${fmtInt(d.n)}</td>
+        <td class="num mono">${d.eta.toFixed(2)}</td>
+        <td class="num mono">${d.rho.toFixed(2)}</td>
+      </tr>`;
+      }).join('')}
+    </tbody>
+  </table>`;
 }
 
 async function loadMoreCommits() {
