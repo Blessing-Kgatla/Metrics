@@ -1,0 +1,201 @@
+"""Per-commit file metrics (Phase 2): the per-repository facts store.
+
+Walks non-merge history once with ``git log --no-merges --numstat`` and writes
+one JSON line per commit to ``analysis/facts.jsonl``:
+
+    {"h": <hash>, "an": <author name>, "ae": <author email>,
+     "cd": <committer date>, "ad": <author date>, "s": <subject>,
+     "f": [[<path>, <lines added>, <lines removed>], ...]}
+
+Rules applied here, per the assignment's commit model:
+- merge commits are excluded (the facts store covers H-bar);
+- binary files (numstat "-" counts) are skipped;
+- rename detection is off in this phase, so a pure rename appears as a
+  deletion plus an addition until the dedicated rename phase adds -M50%.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import time
+from pathlib import Path
+
+from . import git_service, store
+
+FACTS_NAME = "facts.jsonl"
+META_NAME = "meta.json"
+_MAX_BUILD_SECONDS = 900
+
+_HEADER_MARK = "\x01"
+_FIELD_SEP = "\x1f"
+_HEADER_FORMAT = (
+    f"%x01%H{_FIELD_SEP}%an{_FIELD_SEP}%ae{_FIELD_SEP}%cI{_FIELD_SEP}%aI{_FIELD_SEP}%s"
+)
+
+
+class AnalysisError(Exception):
+    """Raised when the per-commit facts build fails."""
+
+
+def build_facts(repo_root: Path, out_dir: Path, commit_count: int) -> dict:
+    """Build ``facts.jsonl`` + ``meta.json`` for a repository; return the meta."""
+    started = time.perf_counter()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    facts_path = out_dir / FACTS_NAME
+    tmp_path = out_dir / (FACTS_NAME + ".tmp")
+    stderr_path = out_dir / "git-stderr.tmp"
+
+    records = 0
+    files_touched: set[str] = set()
+    binary_skipped = 0
+    total_added = 0
+    total_removed = 0
+    current: dict | None = None
+
+    def flush(out) -> None:
+        nonlocal records
+        out.write(json.dumps(current, ensure_ascii=False, separators=(",", ":")) + "\n")
+        records += 1
+
+    if commit_count > 0:
+        cmd = [
+            "git", "-C", str(repo_root),
+            "log", "--no-merges", "--numstat",
+            f"--format={_HEADER_FORMAT}", "HEAD",
+        ]
+        deadline = started + _MAX_BUILD_SECONDS
+        try:
+            with stderr_path.open("wb") as err_fh, tmp_path.open("w", encoding="utf-8") as out:
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=err_fh,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        bufsize=1,
+                    )
+                except FileNotFoundError as exc:
+                    raise AnalysisError("git executable not found on PATH") from exc
+                try:
+                    for raw_line in proc.stdout:  # type: ignore[union-attr]
+                        if time.perf_counter() > deadline:
+                            proc.kill()
+                            raise AnalysisError(
+                                f"analysis exceeded {_MAX_BUILD_SECONDS}s and was aborted"
+                            )
+                        line = raw_line.rstrip("\n").rstrip("\r")
+                        if not line:
+                            continue
+                        if line.startswith(_HEADER_MARK):
+                            if current is not None:
+                                flush(out)
+                            parts = line[1:].split(_FIELD_SEP, 5)
+                            if len(parts) != 6:
+                                current = None
+                                continue
+                            current = {
+                                "h": parts[0],
+                                "an": parts[1],
+                                "ae": parts[2],
+                                "cd": parts[3],
+                                "ad": parts[4],
+                                "s": parts[5],
+                                "f": [],
+                            }
+                        else:
+                            if current is None:
+                                continue
+                            cols = line.split("\t", 2)
+                            if len(cols) != 3:
+                                continue
+                            added_s, removed_s, path = cols
+                            if added_s == "-" or removed_s == "-":
+                                binary_skipped += 1
+                                continue
+                            if not added_s.isdigit() or not removed_s.isdigit():
+                                continue
+                            added, removed = int(added_s), int(removed_s)
+                            path = git_service.decode_path(path)
+                            current["f"].append([path, added, removed])
+                            files_touched.add(path)
+                            total_added += added
+                            total_removed += removed
+                    if current is not None:
+                        flush(out)
+                    proc.wait()
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                returncode = proc.returncode
+                err_text = stderr_path.read_text(encoding="utf-8", errors="replace").strip()
+                if returncode != 0:
+                    raise AnalysisError(err_text or f"git log exited with code {returncode}")
+        except AnalysisError:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        finally:
+            stderr_path.unlink(missing_ok=True)
+    else:
+        tmp_path.write_text("", encoding="utf-8")
+
+    tmp_path.replace(facts_path)
+
+    meta = {
+        "version": 1,
+        "built_at": store.utcnow_iso(),
+        "duration_ms": int((time.perf_counter() - started) * 1000),
+        "commit_count": records,
+        "files_touched": len(files_touched),
+        "binary_skipped": binary_skipped,
+        "total_added": total_added,
+        "total_removed": total_removed,
+        "rename_detection": False,
+    }
+    (out_dir / META_NAME).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return meta
+
+
+def _to_api_item(rec: dict) -> dict:
+    files = [
+        {"path": p, "added": a, "removed": r, "churn": a + r, "growth": a - r}
+        for p, a, r in rec.get("f", [])
+    ]
+    return {
+        "hash": rec.get("h", ""),
+        "short": (rec.get("h") or "")[:7],
+        "author_name": rec.get("an", ""),
+        "author_email": rec.get("ae", ""),
+        "date": rec.get("ad") or rec.get("cd"),
+        "committer_date": rec.get("cd"),
+        "subject": rec.get("s", ""),
+        "added": sum(f["added"] for f in files),
+        "removed": sum(f["removed"] for f in files),
+        "file_count": len(files),
+        "files": files,
+    }
+
+
+def read_facts_page(out_dir: Path, offset: int, limit: int) -> list[dict]:
+    """Return a page of per-commit facts (newest first) in API shape."""
+    facts_path = out_dir / FACTS_NAME
+    if not facts_path.exists():
+        return []
+    items: list[dict] = []
+    with facts_path.open("r", encoding="utf-8") as fh:
+        for idx, line in enumerate(fh):
+            if idx < offset:
+                continue
+            if idx >= offset + limit:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(_to_api_item(json.loads(line)))
+            except json.JSONDecodeError:
+                continue
+    return items

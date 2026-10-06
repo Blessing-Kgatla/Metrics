@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RepoLens — Repository Analysis Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='5' fill='%2300A3A6'/></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-left">
+    <div class="logo"><span class="logo-dot"></span>RepoLens</div>
+    <label class="visually-hidden" for="repoSelectTop">Active repository</label>
+    <select id="repoSelectTop" class="repo-select" disabled></select>
+  </div>
+  <div class="topbar-right">
+    <span class="branch-chip" id="branchChip" hidden></span>
+    <button class="btn ghost" id="refreshBtn" disabled title="Re-read basic repository facts">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>
+      Refresh Scan
+    </button>
+    <button class="btn primary" id="addRepoBtn">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+      Add repository
+    </button>
+  </div>
+  <div class="scanbar" id="scanbar" aria-hidden="true"></div>
+</header>
+
+<div class="filterbar" id="filterbar">
+  <div class="filter-group">
+    <label class="filter-label" for="repoSelectFilter">Repository</label>
+    <select id="repoSelectFilter" class="filter-select" disabled></select>
+  </div>
+  <div class="filter-group is-locked" title="Filtering arrives with Phase 9">
+    <label class="filter-label" for="authorFilter">Author</label>
+    <select id="authorFilter" class="filter-select" disabled><option>All authors</option></select>
+  </div>
+  <div class="filter-group is-locked" title="Filtering arrives with Phase 9">
+    <label class="filter-label" for="pathFilter">Path</label>
+    <input id="pathFilter" class="filter-input" type="text" placeholder="src/**" disabled>
+  </div>
+  <div class="filter-group is-locked" title="Filtering arrives with Phase 9">
+    <label class="filter-label" for="commitsFilter">Commits</label>
+    <select id="commitsFilter" class="filter-select" disabled><option>All history</option></select>
+  </div>
+  <div class="filter-spacer"></div>
+  <div class="filter-scope" id="filterScope"></div>
+</div>
+
+<div class="main">
+  <nav class="sidenav" id="sidenav" aria-label="Primary navigation"></nav>
+  <main class="content" id="content"></main>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<div class="drop-overlay" id="dropOverlay">
+  <div class="drop-card">
+    <svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M12 16V4m0 0 4 4m-4-4-4 4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+    <div>Drop a ZIP of a repository to add it</div>
+  </div>
+</div>
+
+<div id="modalRoot"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

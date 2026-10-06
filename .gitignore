@@ -1,0 +1,13 @@
+# Runtime data: uploaded repositories, registry, temp uploads
+data/
+
+# Working artifacts from the assignment brief (page renders)
+.brief_pages/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# OS noise
+.DS_Store
